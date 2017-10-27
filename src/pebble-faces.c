@@ -1,89 +1,174 @@
 #include <pebble.h>
 #include "netdownload.h"
-
+#define FRAME_MS 250 //Update freq - an optimistic 4 fps
+#define HEAP_FREE 10000 //Keep this amount of heap free
 static Window *window;
 static TextLayer *text_layer;
 static BitmapLayer *bitmap_layer;
 static GBitmap *current_bmp;
+static GBitmap *nxt_bmp;
+static AppTimer *timer;
+static Layer *video_layer;
+bool playing = false;
+unsigned int frames = 0;
+char fpsTxt[20];
 
-static char *images[] = {
-  "http://assets.getpebble.com.s3-website-us-east-1.amazonaws.com/pebble-faces/cherie.png",
-  "http://assets.getpebble.com.s3-website-us-east-1.amazonaws.com/pebble-faces/mtole.png",
-  "http://assets.getpebble.com.s3-website-us-east-1.amazonaws.com/pebble-faces/chris.png",
-  "http://assets.getpebble.com.s3-website-us-east-1.amazonaws.com/pebble-faces/heiko.png",
-  "http://assets.getpebble.com.s3-website-us-east-1.amazonaws.com/pebble-faces/thomas.png",
-  "http://assets.getpebble.com.s3-website-us-east-1.amazonaws.com/pebble-faces/matt.png",
-  "http://assets.getpebble.com.s3-website-us-east-1.amazonaws.com/pebble-faces/katharine.png",
-  "http://assets.getpebble.com.s3-website-us-east-1.amazonaws.com/pebble-faces/katherine.png",
-  "http://assets.getpebble.com.s3-website-us-east-1.amazonaws.com/pebble-faces/alex.png",
-  "http://assets.getpebble.com.s3-website-us-east-1.amazonaws.com/pebble-faces/lukasz.png"
+//Linked list for keeping a frame buffer
+struct llnode {
+  GBitmap *bmp;
+  struct llnode *nxt; //Next frame
+  struct llnode *prv; //Previous frame
 };
+typedef struct llnode ll;
 
-static unsigned long image = 0;
+struct deq {
+  unsigned int len;
+  ll *fst; //First Element
+  ll *lst; //Last Element
+} *fbuff;
 
-void show_next_image() {
-  // show that we are loading by showing no image
-  bitmap_layer_set_bitmap(bitmap_layer, NULL);
+void beginstream(void *ctx) {
+  //Request URL buffer
+  printf("Requesting stream begins");
+  netdownload_request(""); //URL no longer necessary - may become useful in future.
+}
 
-  text_layer_set_text(text_layer, "Loading...");
+void show_frame(Layer *layer, GContext *ctx){
 
-  // Unload the current image if we had one and save a pointer to this one
-  if (current_bmp) {
-    gbitmap_destroy(current_bmp);
-    current_bmp = NULL;
-  }
+  //Draw with transparency
+  if(fbuff->fst != NULL){
+    //Support for layering:
+    graphics_context_set_compositing_mode(ctx, GCompOpSet);
 
-  netdownload_request(images[image]);
+    GRect bounds = gbitmap_get_bounds(fbuff->fst->bmp);
+    graphics_draw_bitmap_in_rect(ctx, fbuff->fst->bmp, GRect(bounds.origin.x, bounds.origin.y + 20, bounds.size.w, bounds.size.h));
 
-  image++;
-  if (image >= sizeof(images)/sizeof(char*)) {
-    image = 0;
+    if(playing && fbuff->fst->nxt != fbuff->fst){ //Save one frame in memory
+      //Free fst and remove reference
+      ll *cur = fbuff->fst->nxt;
+      gbitmap_destroy(fbuff->fst->bmp);
+      fbuff->lst->nxt = cur;
+      free(fbuff->fst);
+      fbuff->fst = cur;
+      fbuff->len -= 1;
+      frames++;
+    }
   }
 }
 
+void play(void *ctx){
+  if(playing){
+    layer_mark_dirty(video_layer); //Update video layer
+
+    //Timer for next frame
+    timer = app_timer_register(FRAME_MS, play, NULL); //Main loop
+  }
+}
+
+static void fpscalc(struct tm *tick_time, TimeUnits changed){
+    snprintf(fpsTxt, 20, "%dbuf %dfps", fbuff->len, frames);
+    frames = 0;
+    layer_mark_dirty(text_layer_get_layer(text_layer));
+}
+
 static void window_load(Window *window) {
+  fbuff = malloc(sizeof(struct deq));
+  fbuff->len = 0; //No frames loaded yet
+
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
 
-  text_layer = text_layer_create((GRect) { .origin = { 0, 72 }, .size = { bounds.size.w, 20 } });
-  text_layer_set_text(text_layer, "Shake it!");
-  text_layer_set_text_alignment(text_layer, GTextAlignmentCenter);
-  layer_add_child(window_layer, text_layer_get_layer(text_layer));
+  video_layer = layer_create(bounds);
+  layer_set_update_proc(video_layer, show_frame);
+  layer_add_child(window_layer, video_layer);
 
-  bitmap_layer = bitmap_layer_create(bounds);
-  layer_add_child(window_layer, bitmap_layer_get_layer(bitmap_layer));
-  current_bmp = NULL;
+  text_layer = text_layer_create(GRect(0,0, 150, 20));
+  layer_add_child(window_layer, text_layer_get_layer(text_layer));
+  text_layer_set_text(text_layer, fpsTxt);
+  text_layer_set_background_color(text_layer, GColorBlack);
+  text_layer_set_text_color(text_layer, GColorWhite);
+
+  //Subscribe for FPS
+  tick_timer_service_subscribe(SECOND_UNIT, fpscalc);
 }
 
 static void window_unload(Window *window) {
   text_layer_destroy(text_layer);
   bitmap_layer_destroy(bitmap_layer);
-  gbitmap_destroy(current_bmp);
+  layer_destroy(video_layer);
+
+  //Free all buffer memory
+  fbuff->lst->nxt = NULL; //Linearise
+  ll *todel = fbuff->fst;
+  while(todel != NULL){
+    ll *nxt = todel->nxt;
+    gbitmap_destroy(todel->bmp);
+    free(todel);
+    todel = nxt;
+  }
+  free(fbuff);
 }
 
 void download_complete_handler(NetDownload *download) {
   printf("Loaded image with %lu bytes", download->length);
   printf("Heap free is %u bytes", heap_bytes_free());
-
-  GBitmap *bmp = gbitmap_create_from_png_data(download->data, download->length);
-  bitmap_layer_set_bitmap(bitmap_layer, bmp);
-
-  // Save pointer to currently shown bitmap (to free it)
-  if (current_bmp) {
-    gbitmap_destroy(current_bmp);
+  if(heap_bytes_free() < HEAP_FREE){
+    printf("Heap too small, dropping frame");
+    //TODO: send 'stop' request so phone stops sending frames
+    return;
   }
-  current_bmp = bmp;
+  //Create bmp
+  GBitmap *bmp = gbitmap_create_from_png_data(download->data, download->length);
 
   // Free the memory now
   free(download->data);
-
-  // We null it out now to avoid a double free
   download->data = NULL;
+
+  if(bmp == NULL){ //For some reason this doesn't work
+    printf("Out of memory, cannot allocate new frame");
+    return;
+  }
+
+  //Create new list element for bmp
+  ll *newLst = malloc(sizeof(ll));
+  newLst->bmp = bmp;
+
+  //Append to fbuff 
+  if(fbuff->lst != NULL){
+    fbuff->lst->nxt = newLst;
+    newLst->prv = fbuff->lst;
+  }
+  fbuff->lst = newLst;
+  if(fbuff->fst != NULL){
+    fbuff->fst->prv = newLst;
+    newLst->nxt = fbuff->fst;
+  }else{ //Nothing in fbuff
+    fbuff->fst = newLst;
+    newLst->nxt = newLst;
+    newLst->prv = newLst;
+  }
+
+  //Increment buffer length: if 6, start playing
+  fbuff->len += 1;
+  if(fbuff->len >= 6 && !playing) {
+    //timer = app_timer_register(FRAME_MS, play, NULL); //Play video
+  }
+  printf("%u Frames in memory", fbuff->len);
+
   netdownload_destroy(download);
 }
 
-void tap_handler(AccelAxisType accel, int32_t direction) {
-  show_next_image();
+static void togglePlayPause(ClickRecognizerRef recognizer, void *context){
+  playing = !playing;
+  printf("Play/Pause Button");
+  if(playing){
+    printf("Playing");
+    timer = app_timer_register(FRAME_MS, play, NULL);
+  }
+}
+
+static void click_config_provider(void *context){
+  window_single_click_subscribe(BUTTON_ID_SELECT, togglePlayPause);
 }
 
 static void init(void) {
@@ -96,9 +181,14 @@ static void init(void) {
     .load = window_load,
     .unload = window_unload,
   });
+  window_set_click_config_provider(window, click_config_provider);
   window_stack_push(window, true);
+	window_set_background_color(window, GColorBlack);
 
-  accel_tap_service_subscribe(tap_handler);
+  light_enable(true);
+
+  //Give enough time for JS to load
+  timer = app_timer_register(1000, beginstream, NULL); //Main loop
 }
 
 static void deinit(void) {
